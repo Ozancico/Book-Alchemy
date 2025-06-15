@@ -10,7 +10,7 @@ Features include:
 """
 
 from flask import Flask, render_template, request, redirect, url_for, flash
-from flask_sqlalchemy import SQLAlchemy
+from data.models import db, Author, Book
 from datetime import datetime
 
 # Initialize Flask app
@@ -19,25 +19,82 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'  # SQLite databas
 app.secret_key = 'your_secret_key_here'  # Required for flashing messages
 
 # Initialize SQLAlchemy with the Flask app
-db = SQLAlchemy(app)
+db.init_app(app)
 
-# Define Author model
-class Author(db.Model):
-    """Model representing a book author."""
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    birth_date = db.Column(db.Date)
-    date_of_death = db.Column(db.Date)
-    books = db.relationship('Book', backref='author', lazy=True)
+def normalize_isbn(isbn):
+    """Entfernt alle Bindestriche und Leerzeichen aus der ISBN."""
+    if not isbn:
+        return None
+    return ''.join(c for c in isbn if c.isdigit() or c.lower() == 'x')
 
-# Define Book model
-class Book(db.Model):
-    """Model representing a book."""
-    id = db.Column(db.Integer, primary_key=True)
-    isbn = db.Column(db.String(20), unique=True, nullable=False)
-    title = db.Column(db.String(200), nullable=False)
-    publication_year = db.Column(db.Integer)
-    author_id = db.Column(db.Integer, db.ForeignKey('author.id'), nullable=False)
+def format_isbn(isbn):
+    """Formatiert eine normalisierte ISBN mit Bindestrichen."""
+    if not isbn:
+        return ""
+    if len(isbn) == 13:  # ISBN-13
+        return f"{isbn[0:3]}-{isbn[3]}-{isbn[4:7]}-{isbn[7:12]}-{isbn[12]}"
+    elif len(isbn) == 10:  # ISBN-10
+        return f"{isbn[0]}-{isbn[1:4]}-{isbn[4:9]}-{isbn[9]}"
+    return isbn
+
+def validate_date(date_str):
+    """Validiert und konvertiert verschiedene Datumsformate in datetime.
+    Unterstützt Formate wie:
+    - YYYY-MM-DD
+    - DD.MM.YYYY
+    - YYYY
+    """
+    if not date_str or date_str.strip() == "":
+        return None
+
+    date_str = date_str.strip()
+
+    # Versuche verschiedene Datumsformate
+    formats = [
+        "%Y-%m-%d",    # 1989-12-31
+        "%d.%m.%Y",    # 31.12.1989
+        "%Y"           # 1989
+    ]
+
+    for fmt in formats:
+        try:
+            if len(date_str) == 4 and fmt == "%Y":  # Nur Jahreszahl
+                return datetime(int(date_str), 1, 1)
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Ungültiges Datumsformat: {date_str}. Bitte verwenden Sie YYYY-MM-DD, DD.MM.YYYY oder YYYY")
+
+def validate_isbn(isbn):
+    """Validiert eine ISBN-Nummer."""
+    if not isbn:
+        return None
+
+    # Entferne alle nicht-alphanumerischen Zeichen
+    cleaned_isbn = normalize_isbn(isbn)
+
+    # Prüfe die Länge
+    if len(cleaned_isbn) not in [10, 13]:
+        raise ValueError(f'ISBN muss 10 oder 13 Stellen haben, hat aber {len(cleaned_isbn)} Stellen')
+
+    return cleaned_isbn
+
+def validate_year(year):
+    """Validiert ein Erscheinungsjahr."""
+    try:
+        year = int(year)
+        current_year = datetime.now().year
+
+        # Erste Bücher wurden ca. ab Jahr 1450 gedruckt (Gutenberg-Bibel)
+        if year < 1450 or year > current_year + 1:  # +1 für Bücher die fürs nächste Jahr angekündigt sind
+            raise ValueError(f'Das Jahr muss zwischen 1450 und {current_year + 1} liegen')
+
+        return year
+    except ValueError as e:
+        if str(e).startswith('Das Jahr muss'):
+            raise
+        raise ValueError('Das Jahr muss eine gültige Zahl sein')
 
 @app.route('/')
 def home():
@@ -62,19 +119,49 @@ def home():
 def add_author():
     """Form to add a new author."""
     if request.method == 'POST':
-        name = request.form['name']
-        birth_date = request.form['birth_date']
-        date_of_death = request.form['date_of_death']
+        name = request.form['name'].strip()
+        birth_date_str = request.form['birth_date']
+        death_date_str = request.form['date_of_death']
 
-        birth_date = datetime.strptime(birth_date, '%Y-%m-%d') if birth_date else None
-        date_of_death = datetime.strptime(date_of_death, '%Y-%m-%d') if date_of_death else None
+        if not name:
+            flash('Der Name des Autors darf nicht leer sein.', 'error')
+            return render_template('add_author.html')
 
-        new_author = Author(name=name, birth_date=birth_date, date_of_death=date_of_death)
-        db.session.add(new_author)
-        db.session.commit()
+        try:
+            birth_date = validate_date(birth_date_str) if birth_date_str else None
+            date_of_death = validate_date(death_date_str) if death_date_str else None
 
-        flash('Author added successfully!', 'success')
-        return redirect(url_for('add_author'))
+            # Prüfe, ob das Sterbedatum nach dem Geburtsdatum liegt
+            if birth_date and date_of_death and date_of_death < birth_date:
+                flash('Das Sterbedatum kann nicht vor dem Geburtsdatum liegen.', 'error')
+                return render_template('add_author.html')
+
+            # Prüfe, ob die Daten in der Zukunft liegen
+            today = datetime.now()
+            if birth_date and birth_date > today:
+                flash('Das Geburtsdatum kann nicht in der Zukunft liegen.', 'error')
+                return render_template('add_author.html')
+            if date_of_death and date_of_death > today:
+                flash('Das Sterbedatum kann nicht in der Zukunft liegen.', 'error')
+                return render_template('add_author.html')
+
+            new_author = Author(
+                name=name,
+                birth_date=birth_date,
+                date_of_death=date_of_death
+            )
+            db.session.add(new_author)
+            db.session.commit()
+            flash('Autor wurde erfolgreich hinzugefügt!', 'success')
+            return redirect(url_for('add_author'))
+
+        except ValueError as e:
+            flash(str(e), 'error')
+            return render_template('add_author.html')
+        except Exception as e:
+            db.session.rollback()
+            flash(f'Fehler beim Hinzufügen des Autors: {str(e)}', 'error')
+            return render_template('add_author.html')
 
     return render_template('add_author.html')
 
@@ -84,22 +171,44 @@ def add_book():
     authors = Author.query.all()
 
     if request.method == 'POST':
-        isbn = request.form['isbn']
-        title = request.form['title']
-        publication_year = request.form['publication_year']
-        author_id = request.form['author_id']
+        try:
+            # Validiere ISBN
+            isbn = validate_isbn(request.form['isbn'])
 
-        new_book = Book(
-            isbn=isbn,
-            title=title,
-            publication_year=int(publication_year),
-            author_id=int(author_id)
-        )
-        db.session.add(new_book)
-        db.session.commit()
+            # Validiere Jahr
+            publication_year = validate_year(request.form['publication_year'])
 
-        flash('Book added successfully!', 'success')
-        return redirect(url_for('add_book'))
+            title = request.form['title'].strip()
+            if not title:
+                raise ValueError('Der Titel darf nicht leer sein')
+
+            author_id = request.form['author_id']
+
+            # Prüfe, ob die ISBN bereits existiert (nach Normalisierung)
+            existing_book = Book.query.filter_by(isbn=isbn).first()
+            if existing_book:
+                flash(f'Ein Buch mit der ISBN {format_isbn(isbn)} existiert bereits.', 'error')
+                return render_template('add_book.html', authors=authors)
+
+            new_book = Book(
+                isbn=isbn,
+                title=title,
+                publication_year=publication_year,
+                author_id=int(author_id)
+            )
+
+            db.session.add(new_book)
+            db.session.commit()
+            flash('Buch wurde erfolgreich hinzugefügt!', 'success')
+            return redirect(url_for('add_book'))
+
+        except ValueError as e:
+            flash(str(e), 'error')
+            return render_template('add_book.html', authors=authors)
+        except Exception as e:
+            db.session.rollback()
+            flash(f'Fehler beim Hinzufügen des Buches: {str(e)}', 'error')
+            return render_template('add_book.html', authors=authors)
 
     return render_template('add_book.html', authors=authors)
 
@@ -118,4 +227,4 @@ with app.app_context():
 
 # Start the app (Codio port fix)
 if __name__ == '__main__':
-    app.run(debug=True, port=5002, host='0.0.0.0')
+    app.run(debug=True, port=5003, host='0.0.0.0')
